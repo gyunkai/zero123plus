@@ -8,8 +8,7 @@ import cv2
 import time
 import datetime
 from rembg import remove
-from diffusers import DiffusionPipeline, EulerAncestralDiscreteScheduler, ControlNetModel
-from controlnet_aux import CannyDetector, MidasDetector, OpenposeDetector, HEDdetector, MLSDdetector, NormalBaeDetector
+from diffusers import DiffusionPipeline, EulerAncestralDiscreteScheduler
 from segment_anything import sam_model_registry, SamPredictor
 
 # Set onnxruntime thread count to avoid thread affinity errors
@@ -110,44 +109,8 @@ def preprocess(predictor, input_image, segment=True, rescale=False):
     # Return both the high-res preprocessed image and a 320x320 version for the model
     return input_image, input_image.resize((320, 320), Image.Resampling.LANCZOS)
 
-def generate_control_image(control_type, input_image, resolution=512):
-    """Generate control image based on the specified type."""
-    if not hasattr(Image, 'Resampling'):
-        Image.Resampling = Image
-        
-    # Resize input image for control net
-    input_np = np.array(input_image.resize((resolution, resolution), Image.Resampling.LANCZOS))
-    
-    if control_type == "canny":
-        detector = CannyDetector()
-        control_image = detector(input_np, low_threshold=100, high_threshold=200)
-        return Image.fromarray(control_image)
-    elif control_type == "depth":
-        detector = MidasDetector.from_pretrained("lllyasviel/ControlNet")
-        control_image = detector(input_np)
-        return control_image
-    elif control_type == "openpose":
-        detector = OpenposeDetector.from_pretrained("lllyasviel/ControlNet")
-        control_image = detector(input_np)
-        return control_image
-    elif control_type == "mlsd":
-        detector = MLSDdetector.from_pretrained("lllyasviel/ControlNet")
-        control_image = detector(input_np)
-        return control_image
-    elif control_type == "normal":
-        detector = NormalBaeDetector.from_pretrained("lllyasviel/ControlNet")
-        control_image = detector(input_np)
-        return control_image
-    elif control_type == "hed":
-        detector = HEDdetector.from_pretrained("lllyasviel/ControlNet")
-        control_image = detector(input_np)
-        return control_image
-    else:
-        raise ValueError(f"Unsupported control type: {control_type}")
-
 def run_pipeline(input_path, output_dir, guidance_scale=4, steps=75, seed=42, 
-               segment=True, rescale=False, model_path=None, control_type=None, 
-               control_image_path=None, control_scale=1.0):
+               segment=True, rescale=False, model_path=None):
     """Run the zero123plus pipeline on an input image and save the output views."""
     # Create output directory if it doesn't exist
     os.makedirs(output_dir, exist_ok=True)
@@ -176,61 +139,18 @@ def run_pipeline(input_path, output_dir, guidance_scale=4, steps=75, seed=42,
     processed_image.save(processed_image_path)
     print(f"Saved preprocessed image to {processed_image_path}")
     
-    # Handle ControlNet if specified
-    controlnet = None
-    control_image = None
-    
-    if control_type or control_image_path:
-        print("Preparing ControlNet...")
-        # Load the controlnet model
-        controlnet = ControlNetModel.from_pretrained(
-            f"lllyasviel/sd-controlnet-{control_type}", torch_dtype=torch.float16
-        ).to(DEVICE)
-        
-        # Generate or load control image
-        if control_image_path:
-            print(f"Loading control image from {control_image_path}")
-            control_image = Image.open(control_image_path).convert("RGB")
-        elif control_type:
-            print(f"Generating {control_type} control image")
-            control_image = generate_control_image(control_type, input_image)
-            # Save the control image
-            control_image_path = os.path.join(output_dir, f"control_{control_type}.png")
-            control_image.save(control_image_path)
-            print(f"Saved control image to {control_image_path}")
-    
     # Load the pipeline
     print("Loading pipeline...")
     if model_path:
-        if controlnet:
-            print("Loading pipeline with ControlNet")
-            pipeline = DiffusionPipeline.from_pretrained(
-                model_path, 
-                controlnet=controlnet,
-                custom_pipeline="sudo-ai/zero123plus-pipeline",
-                torch_dtype=torch.float16
-            )
-        else:
-            pipeline = DiffusionPipeline.from_pretrained(
-                model_path, 
-                custom_pipeline="sudo-ai/zero123plus-pipeline",
-                torch_dtype=torch.float16
-            )
+        pipeline = DiffusionPipeline.from_pretrained(
+            model_path, custom_pipeline="sudo-ai/zero123plus-pipeline",
+            torch_dtype=torch.float16
+        )
     else:
-        if controlnet:
-            print("Loading pipeline with ControlNet")
-            pipeline = DiffusionPipeline.from_pretrained(
-                "sudo-ai/zero123plus-v1.2",
-                controlnet=controlnet,
-                custom_pipeline="sudo-ai/zero123plus-pipeline",
-                torch_dtype=torch.float16
-            )
-        else:
-            pipeline = DiffusionPipeline.from_pretrained(
-                "sudo-ai/zero123plus-v1.2", 
-                custom_pipeline="sudo-ai/zero123plus-pipeline",
-                torch_dtype=torch.float16
-            )
+        pipeline = DiffusionPipeline.from_pretrained(
+            "sudo-ai/zero123plus-v1.2", custom_pipeline="sudo-ai/zero123plus-pipeline",
+            torch_dtype=torch.float16
+        )
     
     # Configure scheduler
     pipeline.scheduler = EulerAncestralDiscreteScheduler.from_config(
@@ -240,21 +160,10 @@ def run_pipeline(input_path, output_dir, guidance_scale=4, steps=75, seed=42,
     
     # Run the pipeline
     print(f"Running pipeline with {steps} steps and guidance scale {guidance_scale}...")
-    
-    # Create pipeline arguments
-    pipeline_args = {
-        "num_inference_steps": steps,
-        "guidance_scale": guidance_scale,
-        "generator": torch.Generator(pipeline.device).manual_seed(seed)
-    }
-    
-    # Add controlnet parameters if applicable
-    if controlnet and control_image:
-        pipeline_args["control_image"] = control_image
-        pipeline_args["controlnet_conditioning_scale"] = control_scale
-    
-    # Run the pipeline
-    output = pipeline(processed_image, **pipeline_args).images[0]
+    output = pipeline(processed_image, 
+                    num_inference_steps=steps,
+                    guidance_scale=guidance_scale,
+                    generator=torch.Generator(pipeline.device).manual_seed(seed)).images[0]
     
     # Extract and save the 6 views
     side_len = output.width // 2
@@ -289,11 +198,6 @@ if __name__ == "__main__":
     parser.add_argument("--no_segment", action="store_true", help="Skip background removal")
     parser.add_argument("--rescale", action="store_true", help="Rescale and recenter the image")
     parser.add_argument("--model_path", help="Path to local model weights (optional)")
-    # ControlNet arguments
-    parser.add_argument("--control_type", choices=["canny", "depth", "openpose", "mlsd", "normal", "hed"], 
-                         help="Type of ControlNet to use")
-    parser.add_argument("--control_image", help="Path to a custom control image (if not generating)")
-    parser.add_argument("--control_scale", type=float, default=1.0, help="ControlNet conditioning scale")
     
     args = parser.parse_args()
     
@@ -305,8 +209,5 @@ if __name__ == "__main__":
         seed=args.seed,
         segment=not args.no_segment,
         rescale=args.rescale,
-        model_path=args.model_path,
-        control_type=args.control_type,
-        control_image_path=args.control_image,
-        control_scale=args.control_scale
+        model_path=args.model_path
     ) 
